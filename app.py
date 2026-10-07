@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 
 # Carga las variables del archivo .env automáticamente
 load_dotenv()
+
+groq_key = os.getenv("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")
+
 # Configuración de página
 st.set_page_config(
     page_title="ProtocoloIA - Auditoría Notarial",
