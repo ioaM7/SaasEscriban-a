@@ -6,7 +6,10 @@ import pdfplumber
 from pdf2image import convert_from_bytes
 import pytesseract
 from groq import Groq
+from dotenv import load_dotenv
 
+# Carga las variables del archivo .env automáticamente
+load_dotenv()
 # Configuración de página
 st.set_page_config(
     page_title="ProtocoloIA - Auditoría Notarial",
