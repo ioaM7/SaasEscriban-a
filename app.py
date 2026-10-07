@@ -1,6 +1,11 @@
-import streamlit as st
-import requests
+import os
 import json
+import io
+import streamlit as st
+import pdfplumber
+from pdf2image import convert_from_bytes
+import pytesseract
+from groq import Groq
 
 # Configuración de página
 st.set_page_config(
@@ -9,47 +14,132 @@ st.set_page_config(
     layout="wide"
 )
 
-# Estilo personalizado mínimo
+# Estilos visuales
 st.markdown("""
     <style>
-    .stApp { background-color: #0e1117; }
-    .status-card { padding: 1.5rem; border-radius: 0.5rem; margin-bottom: 1rem; }
+    .main { background-color: #0e1117; }
+    .stButton>button { width: 100%; border-radius: 5px; height: 3em; }
     </style>
 """, unsafe_allow_html=True)
 
-st.title("⚖️ ProtocoloIA")
-st.subheader("Auditoría Inteligente de Títulos de Propiedad e Informes Dominiales")
+PROMPT_AUDITORIA_NOTARIAL = """
+Eres un asistente de Inteligencia Artificial especializado en auditoría de títulos inmobiliarios, derecho notarial y análisis de informes del Registro de la Propiedad Inmueble (RPI) de Argentina.
 
-# Sidebar para configuración
-with st.sidebar:
-    st.header("⚙️ Configuración")
-    api_url = st.text_input("URL del Backend (Ngrok):", value="http://localhost:8000")
-    st.info("Ingresa la URL pública que te generó ngrok (ejemplo: https://xxxx.ngrok-free.app)")
+Tu tarea es analizar minuciosamente el texto extraído del documento cargado (informe de dominio, matrícula del RPI, certificado de anotaciones personales o escritura) y emitir un DICTAMEN DE AUDITORÍA TÉCNICA.
 
-# Carga de archivos
-uploaded_file = st.file_uploader("Sube el documento a auditar (PDF / Matrícula / Informe RPI)", type=["pdf", "png", "jpg", "jpeg"])
+Debes responder EXCLUSIVAMENTE con un objeto JSON válido que cumpla estrictamente la siguiente estructura (sin texto explicativo antes ni después, sin marcas de markdown afuera del JSON):
 
-if uploaded_file is not None:
-    st.success(f"📄 Archivo cargado: **{uploaded_file.name}**")
+{
+  "estado_dictamen": "APTO" | "REVISION_REQUERIDA" | "RIESGO_DETECTADO",
+  "resumen_ejecutivo": "Explicación concisa en 1 a 3 oraciones sobre el estado del título/documento.",
+  "datos_inmueble": {
+    "matricula_dominio": "Número de matrícula o folio real",
+    "nomenclatura_catastral": "Circunscripción, Sección, Manzana, Parcela, etc.",
+    "ubicacion_domicilio": "Dirección completa o descripción del inmueble",
+    "superficie_medidas": "Superficie total o descripción de linderos"
+  },
+  "titulares": [
+    {
+      "nombre_completo": "Nombre y apellido o Razón Social",
+      "dni_cuit": "Número de documento o CUIT/CUIL",
+      "porcentaje_titularidad": "Porcentaje (ej. 100%, 50%)",
+      "estado_civil": "Soltero/a, Casado/a, Divorciado/a, etc.",
+      "causa_adquisicion": "Compraventa, Donación, Sucesión, etc."
+    }
+  ],
+  "gravamenes_y_restricciones": [
+    {
+      "tipo": "Embargo / Hipoteca / Usufructo / Inalienabilidad / Servidumbre / Ninguno",
+      "monto": "Monto de la traba si aplica o No especificado",
+      "autos_juzgado_escribania": "Juzgado, Fuero, Secretaría o Escribanía interviniente",
+      "fecha_inscripcion": "Fecha de inscripción o tomaduría de razón",
+      "estado_vigencia": "Vigente / Caduco / Cancelado / Incierto"
+    }
+  ],
+  "observaciones_criticas": [
+    "Inconsistencias de DNI/Nombres entre titulares y adquirentes",
+    "Embargos u opositores no cancelados formalmente",
+    "Falta de datos clave en el documento"
+  ],
+  "recomendaciones_para_escribano": [
+    "Acciones preventivas recomendadas antes de la firma de la escritura"
+  ]
+}
+
+REGLAS DE AUDITORÍA:
+1. Si un dato no figura en el texto, asigna "No especificado".
+2. Pon especial atención a los embargos e inhibiciones.
+3. Clasifica el estado general como APTO, REVISION_REQUERIDA o RIESGO_DETECTADO.
+"""
+
+def extraer_texto_pdf(pdf_bytes: bytes) -> str:
+    texto_extraido = ""
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    texto_extraido += text + "\n"
+    except Exception as e:
+        st.warning(f"Aviso al leer texto nativo: {e}")
     
-    if st.button("🔍 Auditar Documento Ahora", type="primary"):
-        with st.spinner("Procesando OCR, analizando gravámenes y generando dictamen..."):
-            try:
-                # Enviar archivo al backend en FastAPI
-                files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
-                endpoint = f"{api_url.rstrip('/')}/api/v1/auditar-titulo"
-                
-                response = requests.post(endpoint, files=files)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    dictamen = data.get("dictamen", {})
+    if len(texto_extraido.strip()) < 100:
+        st.info("🔎 El PDF es escaneado/imagen. Aplicando OCR con Tesseract...")
+        texto_extraido = ""
+        try:
+            images = convert_from_bytes(pdf_bytes)
+            for img in images:
+                texto_pagina = pytesseract.image_to_string(img, lang="spa")
+                texto_extraido += texto_pagina + "\n"
+        except Exception as ocr_err:
+            st.error(f"Error en OCR: {ocr_err}")
+            
+    return texto_extraido.strip()
+
+def auditar_con_groq(texto: str, api_key: str) -> dict:
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": PROMPT_AUDITORIA_NOTARIAL},
+            {"role": "user", "content": f"DOCUMENTO A AUDITAR:\n\n{texto}"}
+        ],
+        temperature=0.1,
+        response_format={"type": "json_object"}
+    )
+    return json.loads(response.choices[0].message.content)
+
+# ENCABEZADO
+st.title("⚖️ ProtocoloIA")
+st.caption("Sistema de Auditoría Inteligente de Títulos Inmobiliarios e Informes Dominiales")
+
+# SIDEBAR PARA LA API KEY
+with st.sidebar:
+    st.header("🔑 Configuración")
+    groq_key = st.text_input("Ingresa tu Groq API Key:", type="password")
+
+# CARGA DE ARCHIVO
+uploaded_file = st.file_uploader("Carga el informe de dominio o matrícula (PDF / Imagen)", type=["pdf", "png", "jpg", "jpeg"])
+
+if uploaded_file and st.button("🚀 Auditar Documento", type="primary"):
+    if not groq_key:
+        st.error("Por favor, ingresa tu API Key de Groq en la barra lateral.")
+    else:
+        with st.spinner("Procesando documento y generando el dictamen notarial..."):
+            file_bytes = uploaded_file.getvalue()
+            texto = extraer_texto_pdf(file_bytes)
+            
+            if not texto:
+                st.error("No se pudo extraer texto del archivo.")
+            else:
+                try:
+                    dictamen = auditar_con_groq(texto, groq_key)
                     
                     st.divider()
                     
-                    # 1. Semáforo de Estado
+                    # Semáforo de Riesgo
                     estado = dictamen.get("estado_dictamen", "REVISION_REQUERIDA")
-                    resumen = dictamen.get("resumen_ejecutivo", "Sin resumen.")
+                    resumen = dictamen.get("resumen_ejecutivo", "")
                     
                     if estado == "APTO":
                         st.success(f"### 🟢 DICTAMEN: APTO\n{resumen}")
@@ -57,57 +147,31 @@ if uploaded_file is not None:
                         st.warning(f"### 🟡 DICTAMEN: REVISIÓN REQUERIDA\n{resumen}")
                     else:
                         st.error(f"### 🔴 DICTAMEN: RIESGO DETECTADO\n{resumen}")
-                        
-                    # 2. Métricas y Datos del Inmueble
-                    col1, col2 = st.columns(2)
                     
-                    datos = dictamen.get("datos_inmueble", {})
+                    # Datos del Inmueble y Titulares
+                    col1, col2 = st.columns(2)
                     with col1:
                         st.markdown("### 🏢 Datos del Inmueble")
-                        st.write(f"**Matrícula / Dominio:** {datos.get('matricula_dominio')}")
-                        st.write(f"**Nomenclatura Catastral:** {datos.get('nomenclatura_catastral')}")
+                        datos = dictamen.get("datos_inmueble", {})
+                        st.write(f"**Matrícula:** {datos.get('matricula_dominio')}")
+                        st.write(f"**Catastro:** {datos.get('nomenclatura_catastral')}")
                         st.write(f"**Ubicación:** {datos.get('ubicacion_domicilio')}")
                         st.write(f"**Superficie:** {datos.get('superficie_medidas')}")
 
                     with col2:
-                        st.markdown("### 👤 Titulares de Dominio")
-                        titulares = dictamen.get("titulares", [])
-                        if titulares:
-                            st.dataframe(titulares, use_container_width=True)
-                        else:
-                            st.write("No se identificaron titulares.")
+                        st.markdown("### 👤 Titulares")
+                        st.dataframe(dictamen.get("titulares", []), use_container_width=True)
 
-                    # 3. Gravámenes y Observaciones
-                    st.divider()
-                    st.markdown("### ⚠️ Gravámenes y Anotaciones Personales")
-                    gravamenes = dictamen.get("gravamenes_y_restricciones", [])
-                    if gravamenes:
-                        st.table(gravamenes)
-                    else:
-                        st.info("Sin gravámenes registrados.")
+                    # Gravámenes
+                    st.markdown("### ⚠️ Gravámenes y Restricciones")
+                    st.table(dictamen.get("gravamenes_y_restricciones", []))
+
+                    # Observaciones
+                    st.markdown("### 📝 Observaciones y Recomendaciones")
+                    for obs in dictamen.get("observaciones_criticas", []):
+                        st.write(f"- 🔴 {obs}")
+                    for rec in dictamen.get("recomendaciones_para_escribano", []):
+                        st.write(f"- 💡 {rec}")
                         
-                    # 4. Observaciones y Recomendaciones
-                    col3, col4 = st.columns(2)
-                    with col3:
-                        st.markdown("### 🚨 Observaciones Críticas")
-                        for obs in dictamen.get("observaciones_criticas", []):
-                            st.write(f"- {obs}")
-                            
-                    with col4:
-                        st.markdown("### 📝 Recomendaciones Notariales")
-                        for rec in dictamen.get("recomendaciones_para_escribano", []):
-                            st.write(f"- {rec}")
-                            
-                    # Exportar Dictamen JSON/PDF
-                    st.download_button(
-                        label="📥 Descargar Dictamen (JSON)",
-                        data=json.dumps(dictamen, indent=2, ensure_ascii=False),
-                        file_name=f"dictamen_{uploaded_file.name}.json",
-                        mime="application/json"
-                    )
-
-                else:
-                    st.error(f"Error en la API ({response.status_code}): {response.text}")
-                    
-            except Exception as e:
-                st.error(f"No se pudo conectar con el backend: {str(e)}")
+                except Exception as e:
+                    st.error(f"Error al analizar con la IA: {e}")
